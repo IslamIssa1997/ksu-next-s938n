@@ -24,7 +24,7 @@ def main():
     with open(manifest_path, 'r') as f:
         manifest = json.load(f)
 
-    for target in manifest.get('targets', []):
+    for target in manifest.get('payloads', []):
         if target.get('payloadId') == 'galaxy-s25-series-2026-06-07':
             target['kernelsu']['url'] = ksud_url
             target['kernelsu']['size'] = ksud_size

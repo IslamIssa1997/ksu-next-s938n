@@ -1,6 +1,6 @@
 {
   "schemaVersion": 3,
-  "targets": [
+  "payloads": [
     {
       "payloadId": "galaxy-s25-series-2026-06-07",
       "displayName": "Galaxy S25 series | Kernel 6.6.98",
