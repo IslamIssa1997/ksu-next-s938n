@@ -157,6 +157,25 @@ def patch_syscall_hook_c(ksu_dir):
     path = os.path.join(ksu_dir, 'kernel', 'hook', 'arm64', 'syscall_hook.c')
     c = read_file(path)
 
+    # 0. Guard patch_syscall_table() on Samsung RKP — only this function needs
+    #    the NO_PATCH_TEXT protection, not ksu_patch_text() globally.
+    #    selinux_hide also uses ksu_patch_text() on normal data pages, so we
+    #    must NOT disable ksu_patch_text() itself.
+    old = ('static int patch_syscall_table(int nr, syscall_fn_t fn)\n'
+           '{\n'
+           '    if (ksu_syscall_table == NULL)\n'
+           '        return -ENOENT;\n')
+    new = ('static int patch_syscall_table(int nr, syscall_fn_t fn)\n'
+           '{\n'
+           '#ifdef CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT\n'
+           '    /* Samsung RKP: syscall table is hypervisor-protected; use kprobe fallback */\n'
+           '    return -EOPNOTSUPP;\n'
+           '#endif\n'
+           '    if (ksu_syscall_table == NULL)\n'
+           '        return -ENOENT;\n')
+    check('patch_syscall_table-rkp-guard', old, c)
+    c = c.replace(old, new, 1)
+
     # 1. Change ksu_syscall_table_hook from void to int, add return values
     old = ('// Direct syscall table patching: overwrite syscall_table[nr] with fn,\n'
            '// save original to *old, and record for restoration at module exit.\n'
@@ -693,30 +712,10 @@ def patch_sucompat(ksu_dir):
 
 
 def patch_patch_memory(ksu_dir):
-    path = os.path.join(ksu_dir, 'kernel', 'hook', 'arm64', 'patch_memory.c')
-    c = read_file(path)
-
-    old = ('int ksu_patch_text(void *dst, void *src, size_t len, int flags)\n'
-           '{\n'
-           '    struct patch_text_info info = {')
-    new = ('int ksu_patch_text(void *dst, void *src, size_t len, int flags)\n'
-           '{\n'
-           '#ifdef CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT\n'
-           '    pr_warn("patch_text disabled for this Samsung target: dst=0x%lx len=%zu flags=0x%x\\n",'
-           ' (unsigned long)dst, len, flags);\n'
-           '    return -EOPNOTSUPP;\n'
-           '#else\n'
-           '    struct patch_text_info info = {')
-    check('patch_memory-no-patch-text', old, c)
-    c = c.replace(old, new, 1)
-
-    old = '    return stop_machine(ksu_patch_text_cb, &info, cpu_online_mask);\n}'
-    new = '    return stop_machine(ksu_patch_text_cb, &info, cpu_online_mask);\n#endif\n}'
-    check('patch_memory-endif', old, c)
-    c = c.replace(old, new, 1)
-
-    write_file(path, c)
-    print("  patched: kernel/hook/arm64/patch_memory.c")
+    # No longer patching ksu_patch_text() itself — the Samsung NO_PATCH_TEXT
+    # guard now lives only in patch_syscall_table() so that selinux_hide can
+    # still use ksu_patch_text() on normal (non-RKP-protected) data pages.
+    pass
 
 
 def patch_app_profile(ksu_dir):
