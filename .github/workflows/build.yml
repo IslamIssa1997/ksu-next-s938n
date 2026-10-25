@@ -120,11 +120,40 @@ jobs:
           name: ksuinit-aarch64
           path: ksu-next/userspace/ksuinit/target/aarch64-linux-android/release/ksuinit
 
-  # ── Step 3: ksud (depends on module + ksuinit) ───────────────────────────────
+  # ── Step 2b: SuSFS guard LKM (needs DDK container, parallel with ksuinit) ────
+  build-susfs-lkm:
+    name: Build susfs_guard_lkm.ko (android15-6.6)
+    runs-on: ubuntu-latest
+    needs: pin-commit
+    container:
+      image: ghcr.io/ylarod/ddk-min:android15-6.6-20260828
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone KernelSU Next at pinned commit
+        run: |
+          git clone https://github.com/KernelSU-Next/KernelSU-Next ksu-next
+          git -C ksu-next checkout ${{ needs.pin-commit.outputs.sha }}
+
+      - name: Build susfs_guard_lkm.ko
+        run: |
+          make -k -C "$KDIR" M="$(pwd)/ksu-next/kernel/susfs" \
+            ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 modules -j$(nproc)
+          llvm-strip -d ksu-next/kernel/susfs/susfs_guard_lkm.ko
+          mkdir -p out
+          cp ksu-next/kernel/susfs/susfs_guard_lkm.ko out/android15-6.6_susfs_guard_lkm.ko
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aarch64-android15-6.6-susfs-lkm
+          path: out/android15-6.6_susfs_guard_lkm.ko
+
+  # ── Step 3: ksud (depends on module + ksuinit + susfs-lkm) ──────────────────
   build-ksud:
     name: Build ksud (Samsung-patched)
     runs-on: ubuntu-latest
-    needs: [pin-commit, build-module, build-ksuinit]
+    needs: [pin-commit, build-module, build-ksuinit, build-susfs-lkm]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -169,6 +198,8 @@ jobs:
              ksu-next/userspace/ksud/bin/aarch64/
           cp artifacts/ksuinit-aarch64/ksuinit \
              ksu-next/userspace/ksud/bin/aarch64/ksuinit
+          cp artifacts/aarch64-android15-6.6-susfs-lkm/android15-6.6_susfs_guard_lkm.ko \
+             ksu-next/userspace/ksud/bin/aarch64/
 
       - name: Assemble LKM bootstrap object
         run: |
