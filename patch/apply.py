@@ -710,8 +710,8 @@ def patch_patch_memory(ksu_dir):
     check('patch_memory-no-patch-text', old, c)
     c = c.replace(old, new, 1)
 
-    old = '    return stop_machine(ksu_patch_text_cb, &info, cpu_online_mask);\n}\n\n#endif /* __aarch64__ */'
-    new = '    return stop_machine(ksu_patch_text_cb, &info, cpu_online_mask);\n#endif\n}\n\n#endif /* __aarch64__ */'
+    old = '    return stop_machine(ksu_patch_text_cb, &info, cpu_online_mask);\n}'
+    new = '    return stop_machine(ksu_patch_text_cb, &info, cpu_online_mask);\n#endif\n}'
     check('patch_memory-endif', old, c)
     c = c.replace(old, new, 1)
 

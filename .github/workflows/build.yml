@@ -60,7 +60,9 @@ jobs:
         run: git clone --depth=1 https://github.com/rifsxd/KernelSU-Next ksu-next
 
       - name: Setup Rust
-        run: rustup update stable
+        run: |
+          rustup update stable
+          rustup target add aarch64-linux-android
 
       - uses: nttld/setup-ndk@v1
         id: setup-ndk
