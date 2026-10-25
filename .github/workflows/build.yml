@@ -23,7 +23,7 @@ jobs:
         run: |
           # Use the exact commit the KSU Next manager CI last built from (= what t.me/ksunext_ci has)
           SHA=$(curl -sf \
-            "https://api.github.com/repos/rifsxd/KernelSU-Next/actions/workflows/build-manager-ci.yml/runs?status=success&per_page=1" \
+            "https://api.github.com/repos/KernelSU-Next/KernelSU-Next/actions/workflows/build-manager-ci.yml/runs?status=success&per_page=1" \
             | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['workflow_runs'][0]['head_sha'])")
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "Pinned to KSU Next manager CI commit: $SHA"
@@ -41,7 +41,7 @@ jobs:
 
       - name: Clone KernelSU Next at pinned commit
         run: |
-          git clone https://github.com/rifsxd/KernelSU-Next ksu-next
+          git clone https://github.com/KernelSU-Next/KernelSU-Next ksu-next
           git -C ksu-next checkout ${{ needs.pin-commit.outputs.sha }}
 
       - name: Apply Samsung patches
@@ -78,7 +78,7 @@ jobs:
 
       - name: Clone KernelSU Next at pinned commit
         run: |
-          git clone https://github.com/rifsxd/KernelSU-Next ksu-next
+          git clone https://github.com/KernelSU-Next/KernelSU-Next ksu-next
           git -C ksu-next checkout ${{ needs.pin-commit.outputs.sha }}
 
       - name: Setup Rust
@@ -128,7 +128,7 @@ jobs:
 
       - name: Clone KernelSU Next at pinned commit
         run: |
-          git clone https://github.com/rifsxd/KernelSU-Next ksu-next
+          git clone https://github.com/KernelSU-Next/KernelSU-Next ksu-next
           git -C ksu-next checkout ${{ needs.pin-commit.outputs.sha }}
 
       - name: Apply Samsung patches to Rust sources
