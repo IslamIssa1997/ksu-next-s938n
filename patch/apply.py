@@ -766,8 +766,9 @@ def patch_late_load_rs(ksu_dir):
     c = read_file(path)
 
     # Remove std::process::Command import (not needed after removing manager restart)
-    old = 'use anyhow::{Context, Result};\nuse log::{info, warn};\nuse rustix::cstr;\nuse std::process::Command;\n'
-    new = 'use anyhow::{Context, Result};\nuse log::{info, warn};\nuse rustix::cstr;\n'
+    # Org repo merged process::Command and time::Instant into a single use std::{} block
+    old = 'use anyhow::{Context, Result};\nuse log::{info, warn};\nuse rustix::cstr;\nuse std::{process::Command, time::Instant};\n'
+    new = 'use anyhow::{Context, Result};\nuse log::{info, warn};\nuse rustix::cstr;\nuse std::time::Instant;\n'
     check('late_load-import', old, c)
     c = c.replace(old, new, 1)
 
