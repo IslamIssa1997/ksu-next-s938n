@@ -12,18 +12,34 @@ permissions:
   contents: write
 
 jobs:
-  # ── Step 1: kernel module (needs DDK container) ───────────────────────────
+  # ── Step 0: pin the KSU Next dev-branch HEAD so every job uses the same commit
+  pin-commit:
+    name: Pin KSU Next commit
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.pin.outputs.sha }}
+    steps:
+      - id: pin
+        run: |
+          SHA=$(git ls-remote https://github.com/rifsxd/KernelSU-Next refs/heads/dev | cut -f1)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "Pinned KSU Next dev commit: $SHA"
+
+  # ── Step 1: kernel module (needs DDK container) ──────────────────────────────
   build-module:
     name: Build kernelsu.ko (android15-6.6)
     runs-on: ubuntu-latest
+    needs: pin-commit
     container:
       image: ghcr.io/ylarod/ddk-min:android15-6.6-20260828
       options: --privileged
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone KernelSU Next
-        run: git clone --depth=1 https://github.com/rifsxd/KernelSU-Next ksu-next
+      - name: Clone KernelSU Next at pinned commit
+        run: |
+          git clone https://github.com/rifsxd/KernelSU-Next ksu-next
+          git -C ksu-next checkout ${{ needs.pin-commit.outputs.sha }}
 
       - name: Apply Samsung patches
         run: python3 patch/apply.py ksu-next
@@ -49,15 +65,18 @@ jobs:
           name: aarch64-android15-6.6-lkm
           path: out/android15-6.6_kernelsu.ko
 
-  # ── Step 2: ksuinit ───────────────────────────────────────────────────────
+  # ── Step 2: ksuinit ──────────────────────────────────────────────────────────
   build-ksuinit:
     name: Build ksuinit
     runs-on: ubuntu-latest
+    needs: pin-commit
     steps:
       - uses: actions/checkout@v4
 
-      - name: Clone KernelSU Next
-        run: git clone --depth=1 https://github.com/rifsxd/KernelSU-Next ksu-next
+      - name: Clone KernelSU Next at pinned commit
+        run: |
+          git clone https://github.com/rifsxd/KernelSU-Next ksu-next
+          git -C ksu-next checkout ${{ needs.pin-commit.outputs.sha }}
 
       - name: Setup Rust
         run: |
@@ -94,18 +113,20 @@ jobs:
           name: ksuinit-aarch64
           path: ksu-next/userspace/ksuinit/target/aarch64-linux-android/release/ksuinit
 
-  # ── Step 3: ksud (depends on module + ksuinit) ────────────────────────────
+  # ── Step 3: ksud (depends on module + ksuinit) ───────────────────────────────
   build-ksud:
     name: Build ksud (Samsung-patched)
     runs-on: ubuntu-latest
-    needs: [build-module, build-ksuinit]
+    needs: [pin-commit, build-module, build-ksuinit]
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # full history so git version is calculated correctly
+          fetch-depth: 0
 
-      - name: Clone KernelSU Next (full)
-        run: git clone https://github.com/rifsxd/KernelSU-Next ksu-next
+      - name: Clone KernelSU Next at pinned commit
+        run: |
+          git clone https://github.com/rifsxd/KernelSU-Next ksu-next
+          git -C ksu-next checkout ${{ needs.pin-commit.outputs.sha }}
 
       - name: Apply Samsung patches to Rust sources
         run: python3 patch/apply.py ksu-next
@@ -163,7 +184,6 @@ jobs:
           KSUD_SIZE=$(wc -c < kernelsu/ksud-s938n-next)
           echo "ksud size: $KSUD_SIZE bytes"
 
-          # Update the ksud size in the manifest
           python3 patch/update_manifest.py support/targets-v3.json "$KSUD_SIZE"
 
       - name: Commit and push artifacts
