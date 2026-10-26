@@ -307,6 +307,9 @@ _SAMSUNG_RKP_BLOCK = r"""
 static bool syscall_hook_manager_initialized;
 
 #if defined(CONFIG_KSU_SAMSUNG_RKP) && defined(CONFIG_KRETPROBES) && defined(__aarch64__)
+#include "feature/adb_root.h"
+#include "selinux/selinux.h"
+
 struct ksu_setresuid_task_work {
     struct callback_head callback;
     uid_t old_uid;
@@ -344,6 +347,30 @@ static long __nocfi samsung_sucompat_execve(const struct pt_regs *regs)
 }
 
 static long __nocfi samsung_sucompat_execveat(const struct pt_regs *regs)
+{
+    struct pt_regs *syscall_regs = (struct pt_regs *)regs;
+    int syscall_nr = syscall_regs->syscallno;
+    long ret;
+
+    syscall_regs->syscallno = SAMSUNG_SUCOMPAT_BYPASS_NR;
+    ret = ksu_hook_execveat(__NR_execveat, regs);
+    syscall_regs->syscallno = syscall_nr;
+    return ret;
+}
+
+static long __nocfi samsung_adbroot_execve(const struct pt_regs *regs)
+{
+    struct pt_regs *syscall_regs = (struct pt_regs *)regs;
+    int syscall_nr = syscall_regs->syscallno;
+    long ret;
+
+    syscall_regs->syscallno = SAMSUNG_SUCOMPAT_BYPASS_NR;
+    ret = ksu_hook_execve(__NR_execve, regs);
+    syscall_regs->syscallno = syscall_nr;
+    return ret;
+}
+
+static long __nocfi samsung_adbroot_execveat(const struct pt_regs *regs)
 {
     struct pt_regs *syscall_regs = (struct pt_regs *)regs;
     int syscall_nr = syscall_regs->syscallno;
@@ -405,20 +432,48 @@ static long __nocfi samsung_sucompat_faccessat2(const struct pt_regs *regs)
 
 static int samsung_sucompat_execve_pre_handler(struct kprobe *probe, struct pt_regs *regs)
 {
-    if (!samsung_sucompat_should_redirect(__NR_execve))
-        return 0;
+    struct pt_regs *syscall_regs = task_pt_regs(current);
 
-    instruction_pointer_set(regs, (unsigned long)samsung_sucompat_execve);
-    return 1;
+    if (unlikely(syscall_regs->syscallno == SAMSUNG_SUCOMPAT_BYPASS_NR)) {
+        syscall_regs->syscallno = __NR_execve;
+        return 0;
+    }
+
+    if (ksu_su_compat_enabled &&
+        ksu_is_allow_uid_for_current(current_uid().val)) {
+        instruction_pointer_set(regs, (unsigned long)samsung_sucompat_execve);
+        return 1;
+    }
+
+    if (current->pid != 1 && is_init(current_cred())) {
+        instruction_pointer_set(regs, (unsigned long)samsung_adbroot_execve);
+        return 1;
+    }
+
+    return 0;
 }
 
 static int samsung_sucompat_execveat_pre_handler(struct kprobe *probe, struct pt_regs *regs)
 {
-    if (!samsung_sucompat_should_redirect(__NR_execveat))
-        return 0;
+    struct pt_regs *syscall_regs = task_pt_regs(current);
 
-    instruction_pointer_set(regs, (unsigned long)samsung_sucompat_execveat);
-    return 1;
+    if (unlikely(syscall_regs->syscallno == SAMSUNG_SUCOMPAT_BYPASS_NR)) {
+        syscall_regs->syscallno = __NR_execveat;
+        return 0;
+    }
+
+    if (ksu_su_compat_enabled &&
+        ksu_is_allow_uid_for_current(current_uid().val)) {
+        instruction_pointer_set(regs, (unsigned long)samsung_sucompat_execveat);
+        return 1;
+    }
+
+    if (current->pid != 1 && is_init(current_cred())) {
+        instruction_pointer_set(regs, (unsigned long)samsung_adbroot_execveat);
+        return 1;
+    }
+
+    return 0;
 }
 
 static int samsung_sucompat_newfstatat_pre_handler(struct kprobe *probe, struct pt_regs *regs)
@@ -1303,6 +1358,46 @@ def patch_app_profile(ksu_dir):
     print("  patched: kernel/policy/app_profile.c")
 
 
+def patch_selinux_c(ksu_dir):
+    path = os.path.join(ksu_dir, 'kernel', 'selinux', 'selinux.c')
+    c = read_file(path)
+
+    # Samsung KDP: escape_to_root_for_adb_root uses commit_creds on a freshly
+    # prepared cred. If the process already holds a KDP-protected credential,
+    # commit_creds triggers an EL2 abort. Route through the KDP-aware wrapper
+    # and sync DEFEX afterwards.
+    old = ('#include "selinux.h"\n')
+    new = ('#include "selinux.h"\n'
+           '#include "ksu_samsung_kdp.h"\n')
+    check('selinux-kdp-include', old, c)
+    c = c.replace(old, new, 1)
+
+    old = ('    if (transive_to_domain(KERNEL_SU_CONTEXT, cred, true)) {\n'
+           '        pr_err("transive domain failed.\\n");\n'
+           '        abort_creds(cred);\n'
+           '        return;\n'
+           '    }\n'
+           '    commit_creds(cred);\n'
+           '}')
+    new = ('    if (transive_to_domain(KERNEL_SU_CONTEXT, cred, true)) {\n'
+           '        pr_err("transive domain failed.\\n");\n'
+           '        abort_creds(cred);\n'
+           '        return;\n'
+           '    }\n'
+           '    if (ksu_samsung_kdp_commit_creds(cred)) {\n'
+           '        pr_err("Samsung KDP credential install failed for adbd\\n");\n'
+           '        abort_creds(cred);\n'
+           '        return;\n'
+           '    }\n'
+           '    ksu_samsung_defex_sync_current();\n'
+           '}')
+    check('selinux-adbroot-kdp', old, c)
+    c = c.replace(old, new, 1)
+
+    write_file(path, c)
+    print("  patched: kernel/selinux/selinux.c")
+
+
 def patch_late_load_rs(ksu_dir):
     path = os.path.join(ksu_dir, 'userspace', 'ksud', 'src', 'late_load.rs')
     c = read_file(path)
@@ -1519,6 +1614,7 @@ def main():
     patch_sucompat(ksu_dir)
     patch_patch_memory(ksu_dir)
     patch_app_profile(ksu_dir)
+    patch_selinux_c(ksu_dir)
     patch_selinux_hide_c(ksu_dir)
     patch_susfs_makefile(ksu_dir)
     patch_susfs_lsm_hook(ksu_dir)
