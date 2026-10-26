@@ -1353,7 +1353,7 @@ def patch_late_load_rs(ksu_dir):
            '    }\n'
            '\n'
            '    // 7b. Load susfs guard LKM now so the Manager cannot race us with a stock binary\n'
-           '    if let Err(e) = crate::susfsd::load(kmi.as_deref()) {\n'
+           '    if let Err(e) = crate::susfsd::load(None) {\n'
            '        warn!("susfs guard load during late-load: {e}");\n'
            '    }\n'
            '\n'
