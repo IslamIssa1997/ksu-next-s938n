@@ -1307,12 +1307,9 @@ def patch_late_load_rs(ksu_dir):
     path = os.path.join(ksu_dir, 'userspace', 'ksud', 'src', 'late_load.rs')
     c = read_file(path)
 
-    # Remove std::process::Command import (not needed after removing manager restart)
-    # Org repo merged process::Command and time::Instant into a single use std::{} block
-    old = 'use anyhow::{Context, Result};\nuse log::{info, warn};\nuse rustix::cstr;\nuse std::{process::Command, time::Instant};\n'
-    new = 'use anyhow::{Context, Result};\nuse log::{info, warn};\nuse rustix::cstr;\nuse std::time::Instant;\n'
+    # Keep std::process::Command (used for adbd restart) but verify import exists
+    old = 'use std::{process::Command, time::Instant};\n'
     check('late_load-import', old, c)
-    c = c.replace(old, new, 1)
 
     # Change function signature: remove daemonize, rename package_name to _
     old = ('pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool) -> Result<()> {\n'
@@ -1364,7 +1361,7 @@ def patch_late_load_rs(ksu_dir):
     check('late_load-susfs-guard', old, c)
     c = c.replace(old, new, 1)
 
-    # Remove manager restart block at the end (step 14)
+    # Replace manager restart with adbd restart for adb_root
     old = ('    // 14. Restart Manager so it gets a fresh ksu fd from the newly loaded kernel module\n'
            '    info!("Restarting KernelSU Next Manager {package_name}...");\n'
            '    let _ = Command::new("am").args(["force-stop", package_name]).status();\n'
@@ -1378,7 +1375,13 @@ def patch_late_load_rs(ksu_dir):
            '\n'
            '    Ok(())\n'
            '}')
-    new = '    Ok(())\n}'
+    new = ('    // 14. Restart adbd so adb_root LD_PRELOAD takes effect\n'
+           '    info!("Restarting adbd for adb_root...");\n'
+           '    let _ = Command::new("stop").arg("adbd").status();\n'
+           '    let _ = Command::new("start").arg("adbd").status();\n'
+           '\n'
+           '    Ok(())\n'
+           '}')
     check('late_load-manager-restart', old, c)
     c = c.replace(old, new, 1)
 
