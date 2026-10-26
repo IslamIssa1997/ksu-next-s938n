@@ -1368,7 +1368,8 @@ def patch_selinux_c(ksu_dir):
     # and sync DEFEX afterwards.
     old = ('#include "selinux.h"\n')
     new = ('#include "selinux.h"\n'
-           '#include "ksu_samsung_kdp.h"\n')
+           '#include "ksu_samsung_kdp.h"\n'
+           '#include "samsung_defex.h"\n')
     check('selinux-kdp-include', old, c)
     c = c.replace(old, new, 1)
 
