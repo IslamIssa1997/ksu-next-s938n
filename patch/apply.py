@@ -718,6 +718,48 @@ def patch_patch_memory(ksu_dir):
     pass
 
 
+def patch_selinux_hide_c(ksu_dir):
+    path = os.path.join(ksu_dir, 'kernel', 'feature', 'selinux_hide.c')
+    c = read_file(path)
+
+    # Add ksu_samsung_kdp.h include
+    old = '#include "selinux_hide.h"\n'
+    new = '#include "selinux_hide.h"\n#include "ksu_samsung_kdp.h"\n'
+    check('selinux_hide-include', old, c)
+    c = c.replace(old, new, 1)
+
+    # Replace commit_creds(new) in ksu_setprocattr with KDP-aware version.
+    # If the calling process holds a KDP-protected credential (because KSU
+    # previously granted it root via ksu_samsung_kdp_commit_creds), the normal
+    # commit_creds() will call put_cred() on the KDP-read-only old credential
+    # and trigger a Samsung EL2 abort.  Routing through ksu_samsung_kdp_commit_creds
+    # handles both the KDP case (CONFIG_KSU_SAMSUNG_KDP=y) and the normal case
+    # (falls back to commit_creds() when KDP is disabled).
+    old = ('    tsec->sid = sid;\n'
+           '\n'
+           '    commit_creds(new);\n'
+           '    return size;\n'
+           '\n'
+           'abort_change:\n'
+           '    abort_creds(new);\n'
+           '    return error;\n')
+    new = ('    tsec->sid = sid;\n'
+           '\n'
+           '    error = ksu_samsung_kdp_commit_creds(new);\n'
+           '    if (error)\n'
+           '        goto abort_change;\n'
+           '    return size;\n'
+           '\n'
+           'abort_change:\n'
+           '    abort_creds(new);\n'
+           '    return error;\n')
+    check('selinux_hide-commit_creds', old, c)
+    c = c.replace(old, new, 1)
+
+    write_file(path, c)
+    print("  patched: kernel/feature/selinux_hide.c")
+
+
 def patch_app_profile(ksu_dir):
     path = os.path.join(ksu_dir, 'kernel', 'policy', 'app_profile.c')
     c = read_file(path)
@@ -948,6 +990,7 @@ def main():
     patch_sucompat(ksu_dir)
     patch_patch_memory(ksu_dir)
     patch_app_profile(ksu_dir)
+    patch_selinux_hide_c(ksu_dir)
     patch_late_load_rs(ksu_dir)
     patch_utils_rs(ksu_dir)
 
