@@ -307,6 +307,9 @@ _SAMSUNG_RKP_BLOCK = r"""
 static bool syscall_hook_manager_initialized;
 
 #if defined(CONFIG_KSU_SAMSUNG_RKP) && defined(CONFIG_KRETPROBES) && defined(__aarch64__)
+#include "feature/adb_root.h"
+#include "selinux/selinux.h"
+
 struct ksu_setresuid_task_work {
     struct callback_head callback;
     uid_t old_uid;
@@ -353,6 +356,22 @@ static long __nocfi samsung_sucompat_execveat(const struct pt_regs *regs)
     ret = ksu_hook_execveat(__NR_execveat, regs);
     syscall_regs->syscallno = syscall_nr;
     return ret;
+}
+
+static long __nocfi samsung_adbroot_execve(const struct pt_regs *regs)
+{
+    long ret = ksu_adb_root_handle_execve((struct pt_regs *)regs);
+    if (ret)
+        pr_err("adb root failed: %ld\n", ret);
+    return ksu_syscall_table[__NR_execve](regs);
+}
+
+static long __nocfi samsung_adbroot_execveat(const struct pt_regs *regs)
+{
+    long ret = ksu_adb_root_handle_execveat((struct pt_regs *)regs);
+    if (ret)
+        pr_err("adb root failed: %ld\n", ret);
+    return ksu_syscall_table[__NR_execveat](regs);
 }
 
 static long __nocfi samsung_sucompat_newfstatat(const struct pt_regs *regs)
@@ -405,19 +424,30 @@ static long __nocfi samsung_sucompat_faccessat2(const struct pt_regs *regs)
 
 static int samsung_sucompat_execve_pre_handler(struct kprobe *probe, struct pt_regs *regs)
 {
-    if (!samsung_sucompat_should_redirect(__NR_execve))
-        return 0;
+    if (samsung_sucompat_should_redirect(__NR_execve)) {
+        instruction_pointer_set(regs, (unsigned long)samsung_sucompat_execve);
+        return 1;
+    }
 
-    instruction_pointer_set(regs, (unsigned long)samsung_sucompat_execve);
-    return 1;
+    if (current->pid != 1 && is_init(current_cred())) {
+        instruction_pointer_set(regs, (unsigned long)samsung_adbroot_execve);
+        return 1;
+    }
+
+    return 0;
 }
 
 static int samsung_sucompat_execveat_pre_handler(struct kprobe *probe, struct pt_regs *regs)
 {
-    if (!samsung_sucompat_should_redirect(__NR_execveat))
-        return 0;
+    if (samsung_sucompat_should_redirect(__NR_execveat)) {
+        instruction_pointer_set(regs, (unsigned long)samsung_sucompat_execveat);
+        return 1;
+    }
 
-    instruction_pointer_set(regs, (unsigned long)samsung_sucompat_execveat);
+    if (current->pid != 1 && is_init(current_cred())) {
+        instruction_pointer_set(regs, (unsigned long)samsung_adbroot_execveat);
+        return 1;
+    }
     return 1;
 }
 
