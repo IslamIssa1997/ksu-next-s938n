@@ -1339,6 +1339,31 @@ def patch_late_load_rs(ksu_dir):
     check('late_load-install', old, c)
     c = c.replace(old, new, 1)
 
+    # Load susfs guard LKM during late-load itself, before the Manager gets a
+    # chance to run its own ksud (which is the stock unpatched binary and would
+    # load an unpatched guard that fails with -14 on Samsung RKP).
+    old = ('    // 7. Initialize features\n'
+           '    crate::feature::init_forced_features();\n'
+           '    if let Err(e) = crate::feature::init_features() {\n'
+           '        warn!("init features failed: {e}");\n'
+           '    }\n'
+           '\n'
+           '    // 8. Execute late-load stage scripts')
+    new = ('    // 7. Initialize features\n'
+           '    crate::feature::init_forced_features();\n'
+           '    if let Err(e) = crate::feature::init_features() {\n'
+           '        warn!("init features failed: {e}");\n'
+           '    }\n'
+           '\n'
+           '    // 7b. Load susfs guard LKM now so the Manager cannot race us with a stock binary\n'
+           '    if let Err(e) = crate::susfsd::load(kmi.as_deref()) {\n'
+           '        warn!("susfs guard load during late-load: {e}");\n'
+           '    }\n'
+           '\n'
+           '    // 8. Execute late-load stage scripts')
+    check('late_load-susfs-guard', old, c)
+    c = c.replace(old, new, 1)
+
     # Remove manager restart block at the end (step 14)
     old = ('    // 14. Restart Manager so it gets a fresh ksu fd from the newly loaded kernel module\n'
            '    info!("Restarting KernelSU Next Manager {package_name}...");\n'
