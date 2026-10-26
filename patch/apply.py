@@ -790,8 +790,475 @@ def patch_selinux_hide_c(ksu_dir):
     check('selinux_hide-commit_creds', old, c)
     c = c.replace(old, new, 1)
 
+    # --- Samsung RKP: selinux_hide patches SELinux rodata (write_op[] table and
+    #     sel_handle_status_ops.open) via ksu_patch_text(), which faults with -EFAULT under
+    #     Samsung RKP (the pages are protected read-only at EL2 by physical address, so the
+    #     fixmap alias ksu_patch_text() uses faults too).  Install kprobes on the target
+    #     functions instead and redirect only app-UID callers (>= 10000) to the existing my_*
+    #     replacements, whose app-UID paths never call the original -> no re-entrancy.  System
+    #     UIDs fall through to the original function unchanged.
+
+    # 1. Kprobe infrastructure + per-hook pre-handlers, injected before the forward decls.
+    old = ('static void hook_selinux_status_open();\n'
+           'static void ksu_selinux_hide_unhook();\n')
+    new = (r'''#ifdef CONFIG_KSU_SAMSUNG_RKP
+#include <linux/kprobes.h>
+#include <linux/ptrace.h>
+
+static struct kprobe samsung_sel_ctx_kp;
+static struct kprobe samsung_sel_acc_kp;
+static struct kprobe samsung_sel_setproc_kp;
+static struct kprobe samsung_sel_status_kp;
+
+static int samsung_sel_ctx_pre(struct kprobe *p, struct pt_regs *regs)
+{
+    if (current_uid().val < 10000)
+        return 0;
+    regs->pc = (unsigned long)my_write_context;
+    return 1;
+}
+
+static int samsung_sel_acc_pre(struct kprobe *p, struct pt_regs *regs)
+{
+    if (current_uid().val < 10000)
+        return 0;
+    regs->pc = (unsigned long)my_write_access;
+    return 1;
+}
+
+static int samsung_sel_setproc_pre(struct kprobe *p, struct pt_regs *regs)
+{
+    const char *name = (const char *)regs->regs[0];
+
+    if (current_uid().val < 10000)
+        return 0;
+    /* my_setprocattr only replaces the "current" attr for apps; every other name falls through
+     * to the original via its call_orig label, which would re-enter this kprobe.  Gate on
+     * name == "current" here so the redirect never reaches that path. */
+    if (!name || strcmp(name, "current"))
+        return 0;
+    regs->pc = (unsigned long)my_setprocattr;
+    return 1;
+}
+
+static int samsung_sel_status_pre(struct kprobe *p, struct pt_regs *regs)
+{
+    /* Only redirect when a fake status page exists; otherwise my_sel_open_handle_status would
+     * call the (kprobed) original and re-enter. */
+    if (current_uid().val < 10000 || !ksu_selinux_hide_enabled || !READ_ONCE(fake_status))
+        return 0;
+    regs->pc = (unsigned long)my_sel_open_handle_status;
+    return 1;
+}
+#endif
+
+static void hook_selinux_status_open();
+static void ksu_selinux_hide_unhook();
+''')
+    check('selinux_hide-kprobe-infra', old, c)
+    c = c.replace(old, new, 1)
+
+    # 2. hook_selinux_status_open(): kprobe instead of patching the file_operations.open slot.
+    old = ('    sel_open_handle_status_fn new_fn = my_sel_open_handle_status;\n'
+           '    orig_sel_open_handle_status = *sel_open_handle_status_slot;\n'
+           '    int ret = ksu_patch_text(sel_open_handle_status_slot, &new_fn, sizeof(new_fn), KSU_PATCH_TEXT_FLUSH_DCACHE);\n'
+           '    if (ret) {\n'
+           '        pr_err("selinux_hide: init: patch_text sel_open_handle_status err: %d\\n", ret);\n'
+           '        sel_open_handle_status_slot = NULL;\n'
+           '        orig_sel_open_handle_status = NULL;\n'
+           '    }\n')
+    new = (r'''    orig_sel_open_handle_status = *sel_open_handle_status_slot;
+#ifdef CONFIG_KSU_SAMSUNG_RKP
+    memset(&samsung_sel_status_kp, 0, sizeof(samsung_sel_status_kp));
+    samsung_sel_status_kp.addr = (kprobe_opcode_t *)orig_sel_open_handle_status;
+    samsung_sel_status_kp.pre_handler = samsung_sel_status_pre;
+    int ret = register_kprobe(&samsung_sel_status_kp);
+    if (ret) {
+        pr_err("selinux_hide: samsung: kprobe sel_open_handle_status err: %d\n", ret);
+        samsung_sel_status_kp.addr = NULL;
+        sel_open_handle_status_slot = NULL;
+        orig_sel_open_handle_status = NULL;
+    }
+#else
+    sel_open_handle_status_fn new_fn = my_sel_open_handle_status;
+    int ret = ksu_patch_text(sel_open_handle_status_slot, &new_fn, sizeof(new_fn), KSU_PATCH_TEXT_FLUSH_DCACHE);
+    if (ret) {
+        pr_err("selinux_hide: init: patch_text sel_open_handle_status err: %d\n", ret);
+        sel_open_handle_status_slot = NULL;
+        orig_sel_open_handle_status = NULL;
+    }
+#endif
+''')
+    check('selinux_hide-status-kprobe', old, c)
+    c = c.replace(old, new, 1)
+
+    # 3. ksu_selinux_hide_enable(): kprobes for context_write / access_write / setprocattr.
+    old = ('    context_write = &selinux_write_op[SEL_CONTEXT];\n'
+           '    pr_info("selinux_hide: context_write: 0x%lx [%pSb]\\n", (unsigned long)*context_write, *context_write);\n'
+           '    write_op_fn my = my_write_context;\n'
+           '    orig_context_write = *context_write;\n'
+           '    ret = ksu_patch_text(context_write, &my, sizeof(my), KSU_PATCH_TEXT_FLUSH_DCACHE);\n'
+           '    if (ret) {\n'
+           '        pr_err("selinux_hide: init: patch_text context_write err: %d\\n", ret);\n'
+           '        goto unhook;\n'
+           '    }\n'
+           '\n'
+           '    access_write = &selinux_write_op[SEL_ACCESS];\n'
+           '    pr_info("selinux_hide: access_write: 0x%lx [%pSb]\\n", (unsigned long)*access_write, *access_write);\n'
+           '    my = my_write_access;\n'
+           '    orig_access_write = *access_write;\n'
+           '    ret = ksu_patch_text(access_write, &my, sizeof(my), KSU_PATCH_TEXT_FLUSH_DCACHE);\n'
+           '    if (ret) {\n'
+           '        pr_err("selinux_hide: init: patch_text access_write err: %d\\n", ret);\n'
+           '        goto unhook;\n'
+           '    }\n'
+           '\n'
+           '    ret = ksu_lsm_hook(&selinux_setprocattr_hook);\n'
+           '    if (ret) {\n'
+           '        pr_err("selinux_hide: init: selinux_setprocattr_hook err: %d\\n", ret);\n'
+           '        goto unhook;\n'
+           '    }\n'
+           '\n'
+           '    return 0;\n')
+    new = (r'''    context_write = &selinux_write_op[SEL_CONTEXT];
+    access_write = &selinux_write_op[SEL_ACCESS];
+    orig_context_write = *context_write;
+    orig_access_write = *access_write;
+#ifdef CONFIG_KSU_SAMSUNG_RKP
+    memset(&samsung_sel_ctx_kp, 0, sizeof(samsung_sel_ctx_kp));
+    samsung_sel_ctx_kp.addr = (kprobe_opcode_t *)orig_context_write;
+    samsung_sel_ctx_kp.pre_handler = samsung_sel_ctx_pre;
+    ret = register_kprobe(&samsung_sel_ctx_kp);
+    if (ret) {
+        pr_err("selinux_hide: samsung: kprobe context_write err: %d\n", ret);
+        samsung_sel_ctx_kp.addr = NULL;
+        goto unhook;
+    }
+
+    memset(&samsung_sel_acc_kp, 0, sizeof(samsung_sel_acc_kp));
+    samsung_sel_acc_kp.addr = (kprobe_opcode_t *)orig_access_write;
+    samsung_sel_acc_kp.pre_handler = samsung_sel_acc_pre;
+    ret = register_kprobe(&samsung_sel_acc_kp);
+    if (ret) {
+        pr_err("selinux_hide: samsung: kprobe access_write err: %d\n", ret);
+        samsung_sel_acc_kp.addr = NULL;
+        goto unhook;
+    }
+
+    memset(&samsung_sel_setproc_kp, 0, sizeof(samsung_sel_setproc_kp));
+    samsung_sel_setproc_kp.addr = (kprobe_opcode_t *)find_kernel_symbol_exact("selinux_setprocattr");
+    if (!samsung_sel_setproc_kp.addr) {
+        pr_err("selinux_hide: samsung: selinux_setprocattr not found\n");
+        ret = -ENOENT;
+        goto unhook;
+    }
+    samsung_sel_setproc_kp.pre_handler = samsung_sel_setproc_pre;
+    ret = register_kprobe(&samsung_sel_setproc_kp);
+    if (ret) {
+        pr_err("selinux_hide: samsung: kprobe selinux_setprocattr err: %d\n", ret);
+        samsung_sel_setproc_kp.addr = NULL;
+        goto unhook;
+    }
+
+    return 0;
+#else
+    {
+    write_op_fn my = my_write_context;
+    ret = ksu_patch_text(context_write, &my, sizeof(my), KSU_PATCH_TEXT_FLUSH_DCACHE);
+    if (ret) {
+        pr_err("selinux_hide: init: patch_text context_write err: %d\n", ret);
+        goto unhook;
+    }
+
+    my = my_write_access;
+    ret = ksu_patch_text(access_write, &my, sizeof(my), KSU_PATCH_TEXT_FLUSH_DCACHE);
+    if (ret) {
+        pr_err("selinux_hide: init: patch_text access_write err: %d\n", ret);
+        goto unhook;
+    }
+    }
+
+    ret = ksu_lsm_hook(&selinux_setprocattr_hook);
+    if (ret) {
+        pr_err("selinux_hide: init: selinux_setprocattr_hook err: %d\n", ret);
+        goto unhook;
+    }
+
+    return 0;
+#endif
+''')
+    check('selinux_hide-enable-kprobe', old, c)
+    c = c.replace(old, new, 1)
+
+    # 4. ksu_selinux_hide_unhook(): unregister the kprobes instead of restoring slots.
+    old = ('static void ksu_selinux_hide_unhook()\n'
+           '{\n'
+           '    int ret;\n'
+           '    if (orig_context_write) {\n'
+           '        ret =\n'
+           '            ksu_patch_text(context_write, &orig_context_write, sizeof(orig_context_write), KSU_PATCH_TEXT_FLUSH_DCACHE);\n'
+           '        orig_context_write = NULL;\n'
+           '        if (ret) {\n'
+           '            pr_err("selinux_hide: exit: patch_text context_write err: %d\\n", ret);\n'
+           '        }\n'
+           '    }\n'
+           '    if (orig_access_write) {\n'
+           '        ret = ksu_patch_text(access_write, &orig_access_write, sizeof(orig_access_write), KSU_PATCH_TEXT_FLUSH_DCACHE);\n'
+           '        orig_access_write = NULL;\n'
+           '        if (ret) {\n'
+           '            pr_err("selinux_hide: exit: patch_text access_write err: %d\\n", ret);\n'
+           '        }\n'
+           '    }\n'
+           '    if (sel_open_handle_status_slot && orig_sel_open_handle_status) {\n'
+           '        ret = ksu_patch_text(sel_open_handle_status_slot, &orig_sel_open_handle_status,\n'
+           '                             sizeof(orig_sel_open_handle_status), KSU_PATCH_TEXT_FLUSH_DCACHE);\n'
+           '        orig_sel_open_handle_status = NULL;\n'
+           '        if (ret) {\n'
+           '            pr_err("selinux_hide: exit: patch_text sel_open_handle_status err: %d\\n", ret);\n'
+           '        }\n'
+           '    }\n'
+           '    ksu_lsm_unhook(&selinux_setprocattr_hook);\n'
+           '}\n')
+    new = (r'''static void ksu_selinux_hide_unhook()
+{
+    int ret;
+#ifdef CONFIG_KSU_SAMSUNG_RKP
+    (void)ret;
+    if (samsung_sel_ctx_kp.addr) {
+        unregister_kprobe(&samsung_sel_ctx_kp);
+        samsung_sel_ctx_kp.addr = NULL;
+    }
+    if (samsung_sel_acc_kp.addr) {
+        unregister_kprobe(&samsung_sel_acc_kp);
+        samsung_sel_acc_kp.addr = NULL;
+    }
+    if (samsung_sel_setproc_kp.addr) {
+        unregister_kprobe(&samsung_sel_setproc_kp);
+        samsung_sel_setproc_kp.addr = NULL;
+    }
+    if (samsung_sel_status_kp.addr) {
+        unregister_kprobe(&samsung_sel_status_kp);
+        samsung_sel_status_kp.addr = NULL;
+    }
+    orig_context_write = NULL;
+    orig_access_write = NULL;
+    orig_sel_open_handle_status = NULL;
+#else
+    if (orig_context_write) {
+        ret =
+            ksu_patch_text(context_write, &orig_context_write, sizeof(orig_context_write), KSU_PATCH_TEXT_FLUSH_DCACHE);
+        orig_context_write = NULL;
+        if (ret) {
+            pr_err("selinux_hide: exit: patch_text context_write err: %d\n", ret);
+        }
+    }
+    if (orig_access_write) {
+        ret = ksu_patch_text(access_write, &orig_access_write, sizeof(orig_access_write), KSU_PATCH_TEXT_FLUSH_DCACHE);
+        orig_access_write = NULL;
+        if (ret) {
+            pr_err("selinux_hide: exit: patch_text access_write err: %d\n", ret);
+        }
+    }
+    if (sel_open_handle_status_slot && orig_sel_open_handle_status) {
+        ret = ksu_patch_text(sel_open_handle_status_slot, &orig_sel_open_handle_status,
+                             sizeof(orig_sel_open_handle_status), KSU_PATCH_TEXT_FLUSH_DCACHE);
+        orig_sel_open_handle_status = NULL;
+        if (ret) {
+            pr_err("selinux_hide: exit: patch_text sel_open_handle_status err: %d\n", ret);
+        }
+    }
+    ksu_lsm_unhook(&selinux_setprocattr_hook);
+#endif
+}
+''')
+    check('selinux_hide-unhook-kprobe', old, c)
+    c = c.replace(old, new, 1)
+
     write_file(path, c)
     print("  patched: kernel/feature/selinux_hide.c")
+
+
+def patch_susfs_makefile(ksu_dir):
+    path = os.path.join(ksu_dir, 'kernel', 'susfs', 'Makefile')
+    c = read_file(path)
+
+    # The susfs guard LKM is built from its own Makefile (not the main kernelsu.ko Kbuild),
+    # so the -DCONFIG_KSU_SAMSUNG_RKP define from patch_kbuild() does not reach it.  Add it
+    # here so the guard's lsm_hook.c kprobe path compiles in.
+    old = 'ccflags-y += -Wno-strict-prototypes -Wno-int-conversion -Wno-gcc-compat -Wno-missing-prototypes\n'
+    new = old + 'ccflags-y += -DCONFIG_KSU_SAMSUNG_RKP=1\n'
+    check('susfs-makefile-rkp', old, c)
+    c = c.replace(old, new, 1)
+
+    write_file(path, c)
+    print("  patched: kernel/susfs/Makefile")
+
+
+def patch_susfs_lsm_hook(ksu_dir):
+    path = os.path.join(ksu_dir, 'kernel', 'susfs', 'lsm_hook.c')
+    c = read_file(path)
+
+    # The guard's <6.12 LSM "insert" places its node at the head of a security_hook_heads
+    # hlist via ksu_patch_text().  That memory is __lsm_ro_after_init, which Samsung RKP
+    # protects read-only at EL2, so the write faults with -EFAULT and the whole guard LKM
+    # refuses to load (sus_path getattr hook fails -> "nothing would be hidden").  Install a
+    # kprobe on selinux_<member> instead and run the replacement from the pre-handler: a
+    # non-zero return (hide, e.g. -ENOENT) is handed back and SELinux's hook skipped; a zero
+    # return lets SELinux run - exactly the "<6.12 insert at head, return 0 to pass through"
+    # semantics.  On <6.12 the replacement never calls the original, so there is no re-entrancy.
+
+    # 1. Samsung kprobe infrastructure, injected after the includes.
+    old = '#include "susfs_log.h"\n'
+    new = (old + r'''
+#if defined(CONFIG_KSU_SAMSUNG_RKP) && LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
+#include <linux/kprobes.h>
+#include <linux/ptrace.h>
+#include "susfs_kprobe.h"
+
+struct ksu_samsung_lsm_slot {
+    struct kprobe kp;
+    void *replacement;
+    struct ksu_lsm_hook *hook;
+    bool used;
+};
+
+static struct ksu_samsung_lsm_slot ksu_samsung_lsm_slots[16];
+
+typedef long (*ksu_samsung_lsm_fn)(long, long, long, long, long);
+
+static long __nocfi ksu_samsung_lsm_invoke(void *fn, struct pt_regs *regs)
+{
+    ksu_samsung_lsm_fn f = (ksu_samsung_lsm_fn)fn;
+    return f(regs->regs[0], regs->regs[1], regs->regs[2], regs->regs[3], regs->regs[4]);
+}
+
+static int ksu_samsung_lsm_pre(struct kprobe *p, struct pt_regs *regs)
+{
+    struct ksu_samsung_lsm_slot *slot = container_of(p, struct ksu_samsung_lsm_slot, kp);
+    long ret = ksu_samsung_lsm_invoke(slot->replacement, regs);
+
+    if (ret) {
+        regs->regs[0] = (unsigned long)ret;
+        regs->pc = regs->regs[30];
+        return 1;
+    }
+    return 0;
+}
+
+static int ksu_samsung_lsm_arm(struct ksu_lsm_hook *hook)
+{
+    char want[64];
+    unsigned long addr;
+    struct ksu_samsung_lsm_slot *slot = NULL;
+    int i, ret;
+
+    snprintf(want, sizeof(want), "selinux_%s", hook->head_name);
+    addr = find_kernel_symbol_exact(want);
+    if (!addr) {
+        pr_err("lsm_hook: samsung: %s not found\n", want);
+        return -ENOENT;
+    }
+
+    for (i = 0; i < ARRAY_SIZE(ksu_samsung_lsm_slots); i++) {
+        if (!ksu_samsung_lsm_slots[i].used) {
+            slot = &ksu_samsung_lsm_slots[i];
+            break;
+        }
+    }
+    if (!slot)
+        return -ENOSPC;
+
+    memset(&slot->kp, 0, sizeof(slot->kp));
+    slot->kp.addr = (kprobe_opcode_t *)addr;
+    slot->kp.pre_handler = ksu_samsung_lsm_pre;
+    slot->replacement = hook->replacement;
+    slot->hook = hook;
+
+    ret = register_kprobe(&slot->kp);
+    if (ret) {
+        susfs_kp_forget_addr(&slot->kp);
+        pr_err("lsm_hook: samsung: register_kprobe(%s) = %d\n", want, ret);
+        return ret;
+    }
+
+    slot->used = true;
+    /* non-NULL sentinel: callers test hook->entry to know the hook is armed */
+    hook->entry = (struct security_hook_list *)slot;
+    SUSFS_LOGI("lsm_hook: samsung kprobe armed on %s @ %lx\n", want, addr);
+    return 0;
+}
+
+static bool ksu_samsung_lsm_disarm(struct ksu_lsm_hook *hook)
+{
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(ksu_samsung_lsm_slots); i++) {
+        struct ksu_samsung_lsm_slot *slot = &ksu_samsung_lsm_slots[i];
+
+        if (slot->used && slot->hook == hook) {
+            unregister_kprobe(&slot->kp);
+            susfs_kp_forget_addr(&slot->kp);
+            slot->used = false;
+            slot->hook = NULL;
+            slot->replacement = NULL;
+            return true;
+        }
+    }
+    return false;
+}
+#endif /* CONFIG_KSU_SAMSUNG_RKP && < 6.12 */
+''')
+    check('susfs-lsm-infra', old, c)
+    c = c.replace(old, new, 1)
+
+    # 2. ksu_lsm_hook(): take the kprobe path for the <6.12 insert branch.
+    old = ('#else\n'
+           '        heads_addr = find_kernel_symbol_exact("security_hook_heads");\n')
+    new = ('#else\n'
+           '#ifdef CONFIG_KSU_SAMSUNG_RKP\n'
+           '        ret = ksu_lsm_hook_track(hook);\n'
+           '        if (ret) {\n'
+           '            pr_err("lsm_hook: too many hooks to track: %d\\n", ret);\n'
+           '            goto out_unlock;\n'
+           '        }\n'
+           '        ret = ksu_samsung_lsm_arm(hook);\n'
+           '        if (ret)\n'
+           '            ksu_lsm_hook_untrack(hook);\n'
+           '        goto out_unlock;\n'
+           '#endif\n'
+           '        heads_addr = find_kernel_symbol_exact("security_hook_heads");\n')
+    check('susfs-lsm-arm', old, c)
+    c = c.replace(old, new, 1)
+
+    # 3. ksu_lsm_unhook(): disarm the kprobe for the <6.12 branch.
+    old = ('#else\n'
+           '    if (!hook->entry) {\n'
+           '        mutex_unlock(&ksu_lsm_hook_lock);\n'
+           '        return;\n'
+           '    }\n'
+           '\n'
+           '    if (hook->entry == &hook->list) {\n')
+    new = ('#else\n'
+           '#ifdef CONFIG_KSU_SAMSUNG_RKP\n'
+           '    if (ksu_samsung_lsm_disarm(hook)) {\n'
+           '        ksu_lsm_hook_untrack(hook);\n'
+           '        hook->entry = NULL;\n'
+           '        mutex_unlock(&ksu_lsm_hook_lock);\n'
+           '        ksu_lsm_hook_drain();\n'
+           '        return;\n'
+           '    }\n'
+           '#endif\n'
+           '    if (!hook->entry) {\n'
+           '        mutex_unlock(&ksu_lsm_hook_lock);\n'
+           '        return;\n'
+           '    }\n'
+           '\n'
+           '    if (hook->entry == &hook->list) {\n')
+    check('susfs-lsm-disarm', old, c)
+    c = c.replace(old, new, 1)
+
+    write_file(path, c)
+    print("  patched: kernel/susfs/lsm_hook.c")
 
 
 def patch_app_profile(ksu_dir):
@@ -1025,6 +1492,8 @@ def main():
     patch_patch_memory(ksu_dir)
     patch_app_profile(ksu_dir)
     patch_selinux_hide_c(ksu_dir)
+    patch_susfs_makefile(ksu_dir)
+    patch_susfs_lsm_hook(ksu_dir)
     patch_late_load_rs(ksu_dir)
     patch_utils_rs(ksu_dir)
 
