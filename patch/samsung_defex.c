@@ -5,6 +5,7 @@
 #include <linux/fs.h>
 #include <linux/gfp.h>
 #include <linux/kprobes.h>
+#include <linux/namei.h>
 #include <linux/sched.h>
 #include <linux/string.h>
 
@@ -31,14 +32,35 @@ static bool defex_enforce_hooked;
  * NOT covered by the root-in-ksu-domain bypass below and get denied with
  * "[DEFEX] Immutable root violation ... /data/adb/modules/...". Allow any task
  * to reach the KSU data dir so module backends can initialise.
+ *
+ * This runs on every file syscall that reaches task_defex_enforce, so it must
+ * be cheap: calling d_path() per syscall adds measurable latency that timing
+ * side-channels can fingerprint. Resolve /data/adb to a dentry once (from the
+ * sleepable init path, before the hook goes live) and then do an
+ * allocation-free superblock compare + parent-pointer ancestor walk. The
+ * d_path() variant is kept only as a correctness fallback for the window
+ * before the dentry is cached (e.g. if /data was not yet mounted at init).
  */
-static bool ksu_defex_file_under_ksu_data(struct file *f)
+static struct dentry *ksu_adb_dentry;
+
+static void ksu_defex_cache_adb_dentry(void)
+{
+    struct path p;
+
+    if (ksu_adb_dentry)
+        return;
+    /* must only be called from a sleepable context, never from the kprobe */
+    if (kern_path("/data/adb", LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &p))
+        return;
+    ksu_adb_dentry = dget(p.dentry);
+    path_put(&p);
+    pr_info("Samsung DEFEX: cached /data/adb dentry for fast module-path bypass\n");
+}
+
+static bool ksu_defex_file_under_ksu_data_slow(struct file *f)
 {
     char *buf, *path;
     bool match = false;
-
-    if (!f)
-        return false;
 
     buf = (char *)__get_free_page(GFP_ATOMIC);
     if (!buf)
@@ -50,6 +72,30 @@ static bool ksu_defex_file_under_ksu_data(struct file *f)
 
     free_page((unsigned long)buf);
     return match;
+}
+
+static bool ksu_defex_file_under_ksu_data(struct file *f)
+{
+    struct dentry *d, *target;
+
+    if (!f)
+        return false;
+
+    d = f->f_path.dentry;
+    if (!d)
+        return false;
+
+    target = READ_ONCE(ksu_adb_dentry);
+    if (likely(target)) {
+        /* one compare rejects everything not on the userdata superblock, then
+         * is_subdir() confirms the file is at or below /data/adb with a cheap
+         * parent-pointer walk (no allocation, no path formatting). */
+        if (d->d_sb != target->d_sb)
+            return false;
+        return is_subdir(d, target);
+    }
+
+    return ksu_defex_file_under_ksu_data_slow(f);
 }
 
 static int ksu_samsung_defex_pre_handler(struct kprobe *probe, struct pt_regs *regs)
@@ -85,6 +131,9 @@ int ksu_samsung_defex_init(void)
         return -ENOENT;
     }
 
+    /* cache /data/adb before the hook goes live so the fast path is ready */
+    ksu_defex_cache_adb_dentry();
+
     ret = register_kprobe(&defex_enforce_kprobe);
     if (ret) {
         pr_err("Samsung DEFEX enforce hook unavailable: %d\n", ret);
@@ -103,6 +152,10 @@ void ksu_samsung_defex_exit(void)
     if (defex_enforce_hooked) {
         unregister_kprobe(&defex_enforce_kprobe);
         defex_enforce_hooked = false;
+    }
+    if (ksu_adb_dentry) {
+        dput(ksu_adb_dentry);
+        ksu_adb_dentry = NULL;
     }
 #endif
 }
