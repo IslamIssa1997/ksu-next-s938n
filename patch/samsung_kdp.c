@@ -120,9 +120,11 @@ void ksu_samsung_kdp_put_cred(const struct cred *cred)
     struct cred *mutable_cred = (struct cred *)cred;
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
-    if (mutable_cred && kdp_usecount_sub_and_test_fn(1, mutable_cred))
+    if (mutable_cred && kdp_usecount_sub_and_test_fn &&
+        kdp_usecount_sub_and_test_fn(1, mutable_cred))
 #else
-    if (mutable_cred && kdp_usecount_dec_and_test_fn(mutable_cred))
+    if (mutable_cred && kdp_usecount_dec_and_test_fn &&
+        kdp_usecount_dec_and_test_fn(mutable_cred))
 #endif
         __put_cred(mutable_cred);
 #else
