@@ -136,6 +136,9 @@ jobs:
           git clone https://github.com/KernelSU-Next/KernelSU-Next ksu-next
           git -C ksu-next checkout ${{ needs.pin-commit.outputs.sha }}
 
+      - name: Apply Samsung patches
+        run: python3 patch/apply.py ksu-next
+
       - name: Build susfs_guard_lkm.ko
         run: |
           make -k -C "$KDIR" M="$(pwd)/ksu-next/kernel/susfs" \
