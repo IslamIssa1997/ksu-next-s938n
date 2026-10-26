@@ -1,7 +1,12 @@
 #include <linux/cred.h>
+#include <linux/dcache.h>
+#include <linux/err.h>
 #include <linux/errno.h>
+#include <linux/fs.h>
+#include <linux/gfp.h>
 #include <linux/kprobes.h>
 #include <linux/sched.h>
+#include <linux/string.h>
 
 #include "compat/samsung_defex.h"
 #include "infra/symbol_resolver.h"
@@ -18,12 +23,45 @@ static defex_get_task_creds_t defex_get_task_creds;
 static defex_set_task_creds_t defex_set_task_creds;
 static bool defex_enforce_hooked;
 
+/*
+ * Samsung DEFEX enforces an "immutable root" check that blocks access to
+ * /data/adb even for processes KSU has granted. Zygisk modules (e.g. HMA-OSS)
+ * read their files from /data/adb/modules/... inside system_server and forked
+ * app processes, which run as app UIDs in an app SELinux domain - so they are
+ * NOT covered by the root-in-ksu-domain bypass below and get denied with
+ * "[DEFEX] Immutable root violation ... /data/adb/modules/...". Allow any task
+ * to reach the KSU data dir so module backends can initialise.
+ */
+static bool ksu_defex_file_under_ksu_data(struct file *f)
+{
+    char *buf, *path;
+    bool match = false;
+
+    if (!f)
+        return false;
+
+    buf = (char *)__get_free_page(GFP_ATOMIC);
+    if (!buf)
+        return false;
+
+    path = d_path(&f->f_path, buf, PAGE_SIZE);
+    if (!IS_ERR(path))
+        match = (strncmp(path, "/data/adb/", 10) == 0);
+
+    free_page((unsigned long)buf);
+    return match;
+}
+
 static int ksu_samsung_defex_pre_handler(struct kprobe *probe, struct pt_regs *regs)
 {
     struct task_struct *task = (struct task_struct *)regs->regs[0];
+    struct file *f = (struct file *)regs->regs[1];
 
     (void)probe;
     if (task == current && current_uid().val == 0 && is_ksu_domain())
+        regs->regs[0] = 0;
+    else if (ksu_defex_file_under_ksu_data(f))
+        /* bypass immutable-root enforcement for /data/adb module access */
         regs->regs[0] = 0;
 
     return 0;
