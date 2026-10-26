@@ -1414,7 +1414,7 @@ def patch_late_load_rs(ksu_dir):
            '    dump_process_info("late-load start");\n'
            '\n'
            '    // 1. Check if KernelSU is already loaded\n')
-    new = ('pub fn run(_package_name: &String, kmi: Option<String>, allow_shell: bool) -> Result<()> {\n'
+    new = ('pub fn run(package_name: &String, kmi: Option<String>, allow_shell: bool) -> Result<()> {\n'
            '    info!("late-load command triggered!");\n'
            '    dump_process_info("late-load start");\n'
            '\n'
