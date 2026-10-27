@@ -321,6 +321,20 @@ static bool samsung_sucompat_kprobes_registered;
 
 #define SAMSUNG_SUCOMPAT_BYPASS_NR (-2)
 
+/*
+ * Samsung RKP blocks syscall-table patching, so KSU falls back to kprobes on
+ * syscall entries. Kprobes on the hot stat/access syscalls (newfstatat, statx,
+ * faccessat, faccessat2) add latency to a large fraction of all syscalls,
+ * which timing side-channels fingerprint as a kernel hook. These kprobes only
+ * drive *legacy* path-trigger sucompat; modern manager/prctl root grants go
+ * through the per-task syscall tracepoint instead. Set to 0 to skip registering
+ * them (much quieter against timing side-channels, at the cost of stat/access
+ * su-path triggering). execve/execveat sucompat stays enabled either way.
+ */
+#ifndef KSU_SAMSUNG_SUCOMPAT_STAT_ACCESS
+#define KSU_SAMSUNG_SUCOMPAT_STAT_ACCESS 0
+#endif
+
 static bool samsung_sucompat_should_redirect(int syscall_nr)
 {
     struct pt_regs *syscall_regs = task_pt_regs(current);
@@ -520,19 +534,19 @@ static struct kprobe samsung_sucompat_execveat_kprobe = {
     .pre_handler = samsung_sucompat_execveat_pre_handler,
 };
 
-static struct kprobe samsung_sucompat_newfstatat_kprobe = {
+static struct kprobe samsung_sucompat_newfstatat_kprobe __maybe_unused = {
     .pre_handler = samsung_sucompat_newfstatat_pre_handler,
 };
 
-static struct kprobe samsung_sucompat_faccessat_kprobe = {
+static struct kprobe samsung_sucompat_faccessat_kprobe __maybe_unused = {
     .pre_handler = samsung_sucompat_faccessat_pre_handler,
 };
 
-static struct kprobe samsung_sucompat_statx_kprobe = {
+static struct kprobe samsung_sucompat_statx_kprobe __maybe_unused = {
     .pre_handler = samsung_sucompat_statx_pre_handler,
 };
 
-static struct kprobe samsung_sucompat_faccessat2_kprobe = {
+static struct kprobe samsung_sucompat_faccessat2_kprobe __maybe_unused = {
     .pre_handler = samsung_sucompat_faccessat2_pre_handler,
 };
 
@@ -547,6 +561,7 @@ static int samsung_sucompat_hook_init(void)
         (kprobe_opcode_t *)READ_ONCE(ksu_syscall_table[__NR_execve]);
     samsung_sucompat_execveat_kprobe.addr =
         (kprobe_opcode_t *)READ_ONCE(ksu_syscall_table[__NR_execveat]);
+#if KSU_SAMSUNG_SUCOMPAT_STAT_ACCESS
     samsung_sucompat_newfstatat_kprobe.addr =
         (kprobe_opcode_t *)READ_ONCE(ksu_syscall_table[__NR_newfstatat]);
     samsung_sucompat_faccessat_kprobe.addr =
@@ -555,6 +570,7 @@ static int samsung_sucompat_hook_init(void)
         (kprobe_opcode_t *)READ_ONCE(ksu_syscall_table[__NR_statx]);
     samsung_sucompat_faccessat2_kprobe.addr =
         (kprobe_opcode_t *)READ_ONCE(ksu_syscall_table[__NR_faccessat2]);
+#endif
 
     ksu_sucompat_init();
 
@@ -566,6 +582,7 @@ static int samsung_sucompat_hook_init(void)
     if (ret)
         goto unregister_execve;
 
+#if KSU_SAMSUNG_SUCOMPAT_STAT_ACCESS
     ret = register_kprobe(&samsung_sucompat_newfstatat_kprobe);
     if (ret)
         goto unregister_execveat;
@@ -581,11 +598,13 @@ static int samsung_sucompat_hook_init(void)
     ret = register_kprobe(&samsung_sucompat_faccessat2_kprobe);
     if (ret)
         goto unregister_statx;
+#endif
 
     samsung_sucompat_kprobes_registered = true;
     pr_info("hook_manager: Samsung sucompat kprobes registered\n");
     return 0;
 
+#if KSU_SAMSUNG_SUCOMPAT_STAT_ACCESS
 unregister_statx:
     unregister_kprobe(&samsung_sucompat_statx_kprobe);
 unregister_faccessat:
@@ -594,6 +613,7 @@ unregister_newfstatat:
     unregister_kprobe(&samsung_sucompat_newfstatat_kprobe);
 unregister_execveat:
     unregister_kprobe(&samsung_sucompat_execveat_kprobe);
+#endif
 unregister_execve:
     unregister_kprobe(&samsung_sucompat_execve_kprobe);
 exit_sucompat:
@@ -606,10 +626,12 @@ static void samsung_sucompat_hook_exit(void)
     if (!samsung_sucompat_kprobes_registered)
         return;
 
+#if KSU_SAMSUNG_SUCOMPAT_STAT_ACCESS
     unregister_kprobe(&samsung_sucompat_faccessat2_kprobe);
     unregister_kprobe(&samsung_sucompat_statx_kprobe);
     unregister_kprobe(&samsung_sucompat_faccessat_kprobe);
     unregister_kprobe(&samsung_sucompat_newfstatat_kprobe);
+#endif
     unregister_kprobe(&samsung_sucompat_execveat_kprobe);
     unregister_kprobe(&samsung_sucompat_execve_kprobe);
     samsung_sucompat_kprobes_registered = false;
