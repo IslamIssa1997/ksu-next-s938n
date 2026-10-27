@@ -914,6 +914,98 @@ def patch_patch_memory(ksu_dir):
     pass
 
 
+def patch_dispatch_c(ksu_dir):
+    # Hide the LKM / late-load state from the KernelSU manager UI only. ksud and
+    # other root callers still receive the real flags (is_manager() is false for
+    # them), so late-load / soft-reboot / module behavior is unchanged; only the
+    # manager's cosmetic "LKM"/"jailbreak" badge goes away.
+    path = os.path.join(ksu_dir, 'kernel', 'supercall', 'dispatch.c')
+    c = read_file(path)
+
+    # do_get_info (uapi v3+)
+    old = ('    struct ksu_get_info_cmd cmd = { .version = KERNEL_SU_VERSION, .flags = 0 };\n'
+           '\n'
+           '#ifdef MODULE\n'
+           '    cmd.flags |= KSU_GET_INFO_FLAG_LKM;\n'
+           '    if (ksu_bundled) {\n'
+           '        cmd.flags |= KSU_GET_INFO_FLAG_BUNDLED;\n'
+           '    }\n'
+           '#endif\n'
+           '\n'
+           '    if (ksuver_override)\n'
+           '        cmd.version = ksuver_override;\n'
+           '\n'
+           '    if (is_manager()) {\n'
+           '        cmd.flags |= KSU_GET_INFO_FLAG_MANAGER;\n'
+           '    }\n'
+           '    if (ksu_late_loaded) {\n'
+           '        cmd.flags |= KSU_GET_INFO_FLAG_LATE_LOAD;\n'
+           '    }')
+    new = ('    struct ksu_get_info_cmd cmd = { .version = KERNEL_SU_VERSION, .flags = 0 };\n'
+           '    bool manager = is_manager();\n'
+           '\n'
+           '#ifdef MODULE\n'
+           '    /* Hide LKM/late-load state from the manager UI only (cosmetic);\n'
+           '     * ksud and other root callers still see the real flags. */\n'
+           '    if (!manager)\n'
+           '        cmd.flags |= KSU_GET_INFO_FLAG_LKM;\n'
+           '    if (ksu_bundled) {\n'
+           '        cmd.flags |= KSU_GET_INFO_FLAG_BUNDLED;\n'
+           '    }\n'
+           '#endif\n'
+           '\n'
+           '    if (ksuver_override)\n'
+           '        cmd.version = ksuver_override;\n'
+           '\n'
+           '    if (manager) {\n'
+           '        cmd.flags |= KSU_GET_INFO_FLAG_MANAGER;\n'
+           '    }\n'
+           '    if (ksu_late_loaded && !manager) {\n'
+           '        cmd.flags |= KSU_GET_INFO_FLAG_LATE_LOAD;\n'
+           '    }')
+    check('dispatch.c-get-info', old, c)
+    c = c.replace(old, new, 1)
+
+    # do_get_info_legacy
+    old = ('    struct ksu_get_info_legacy_cmd cmd = { .version = KERNEL_SU_VERSION, .flags = 0 };\n'
+           '\n'
+           '#ifdef MODULE\n'
+           '    cmd.flags |= KSU_GET_INFO_FLAG_LKM;\n'
+           '    if (ksu_bundled) {\n'
+           '        cmd.flags |= KSU_GET_INFO_FLAG_BUNDLED;\n'
+           '    }\n'
+           '#endif\n'
+           '\n'
+           '    if (is_manager()) {\n'
+           '        cmd.flags |= KSU_GET_INFO_FLAG_MANAGER;\n'
+           '    }\n'
+           '    if (ksu_late_loaded) {\n'
+           '        cmd.flags |= KSU_GET_INFO_FLAG_LATE_LOAD;\n'
+           '    }')
+    new = ('    struct ksu_get_info_legacy_cmd cmd = { .version = KERNEL_SU_VERSION, .flags = 0 };\n'
+           '    bool manager = is_manager();\n'
+           '\n'
+           '#ifdef MODULE\n'
+           '    if (!manager)\n'
+           '        cmd.flags |= KSU_GET_INFO_FLAG_LKM;\n'
+           '    if (ksu_bundled) {\n'
+           '        cmd.flags |= KSU_GET_INFO_FLAG_BUNDLED;\n'
+           '    }\n'
+           '#endif\n'
+           '\n'
+           '    if (manager) {\n'
+           '        cmd.flags |= KSU_GET_INFO_FLAG_MANAGER;\n'
+           '    }\n'
+           '    if (ksu_late_loaded && !manager) {\n'
+           '        cmd.flags |= KSU_GET_INFO_FLAG_LATE_LOAD;\n'
+           '    }')
+    check('dispatch.c-get-info-legacy', old, c)
+    c = c.replace(old, new, 1)
+
+    write_file(path, c)
+    print("  patched: kernel/supercall/dispatch.c")
+
+
 def patch_selinux_hide_c(ksu_dir):
     path = os.path.join(ksu_dir, 'kernel', 'feature', 'selinux_hide.c')
     c = read_file(path)
@@ -1755,6 +1847,7 @@ def main():
     patch_tp_marker(ksu_dir)
     patch_sucompat(ksu_dir)
     patch_patch_memory(ksu_dir)
+    patch_dispatch_c(ksu_dir)
     patch_app_profile(ksu_dir)
     patch_selinux_c(ksu_dir)
     patch_selinux_hide_c(ksu_dir)
