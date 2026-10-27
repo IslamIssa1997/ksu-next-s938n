@@ -382,18 +382,6 @@ static long __nocfi samsung_adbroot_execveat(const struct pt_regs *regs)
     return ret;
 }
 
-static long __nocfi samsung_sucompat_newfstatat(const struct pt_regs *regs)
-{
-    struct pt_regs *syscall_regs = (struct pt_regs *)regs;
-    int syscall_nr = syscall_regs->syscallno;
-    long ret;
-
-    syscall_regs->syscallno = SAMSUNG_SUCOMPAT_BYPASS_NR;
-    ret = ksu_hook_newfstatat(__NR_newfstatat, regs);
-    syscall_regs->syscallno = syscall_nr;
-    return ret;
-}
-
 static long __nocfi samsung_sucompat_faccessat(const struct pt_regs *regs)
 {
     struct pt_regs *syscall_regs = (struct pt_regs *)regs;
@@ -402,18 +390,6 @@ static long __nocfi samsung_sucompat_faccessat(const struct pt_regs *regs)
 
     syscall_regs->syscallno = SAMSUNG_SUCOMPAT_BYPASS_NR;
     ret = ksu_hook_faccessat(__NR_faccessat, regs);
-    syscall_regs->syscallno = syscall_nr;
-    return ret;
-}
-
-static long __nocfi samsung_sucompat_statx(const struct pt_regs *regs)
-{
-    struct pt_regs *syscall_regs = (struct pt_regs *)regs;
-    int syscall_nr = syscall_regs->syscallno;
-    long ret;
-
-    syscall_regs->syscallno = SAMSUNG_SUCOMPAT_BYPASS_NR;
-    ret = ksu_hook_newfstatat(__NR_statx, regs);
     syscall_regs->syscallno = syscall_nr;
     return ret;
 }
@@ -476,30 +452,12 @@ static int samsung_sucompat_execveat_pre_handler(struct kprobe *probe, struct pt
     return 0;
 }
 
-static int samsung_sucompat_newfstatat_pre_handler(struct kprobe *probe, struct pt_regs *regs)
-{
-    if (!samsung_sucompat_should_redirect(__NR_newfstatat))
-        return 0;
-
-    instruction_pointer_set(regs, (unsigned long)samsung_sucompat_newfstatat);
-    return 1;
-}
-
 static int samsung_sucompat_faccessat_pre_handler(struct kprobe *probe, struct pt_regs *regs)
 {
     if (!samsung_sucompat_should_redirect(__NR_faccessat))
         return 0;
 
     instruction_pointer_set(regs, (unsigned long)samsung_sucompat_faccessat);
-    return 1;
-}
-
-static int samsung_sucompat_statx_pre_handler(struct kprobe *probe, struct pt_regs *regs)
-{
-    if (!samsung_sucompat_should_redirect(__NR_statx))
-        return 0;
-
-    instruction_pointer_set(regs, (unsigned long)samsung_sucompat_statx);
     return 1;
 }
 
@@ -520,16 +478,8 @@ static struct kprobe samsung_sucompat_execveat_kprobe = {
     .pre_handler = samsung_sucompat_execveat_pre_handler,
 };
 
-static struct kprobe samsung_sucompat_newfstatat_kprobe = {
-    .pre_handler = samsung_sucompat_newfstatat_pre_handler,
-};
-
 static struct kprobe samsung_sucompat_faccessat_kprobe = {
     .pre_handler = samsung_sucompat_faccessat_pre_handler,
-};
-
-static struct kprobe samsung_sucompat_statx_kprobe = {
-    .pre_handler = samsung_sucompat_statx_pre_handler,
 };
 
 static struct kprobe samsung_sucompat_faccessat2_kprobe = {
@@ -547,17 +497,21 @@ static int samsung_sucompat_hook_init(void)
         (kprobe_opcode_t *)READ_ONCE(ksu_syscall_table[__NR_execve]);
     samsung_sucompat_execveat_kprobe.addr =
         (kprobe_opcode_t *)READ_ONCE(ksu_syscall_table[__NR_execveat]);
-    samsung_sucompat_newfstatat_kprobe.addr =
-        (kprobe_opcode_t *)READ_ONCE(ksu_syscall_table[__NR_newfstatat]);
     samsung_sucompat_faccessat_kprobe.addr =
         (kprobe_opcode_t *)READ_ONCE(ksu_syscall_table[__NR_faccessat]);
-    samsung_sucompat_statx_kprobe.addr =
-        (kprobe_opcode_t *)READ_ONCE(ksu_syscall_table[__NR_statx]);
     samsung_sucompat_faccessat2_kprobe.addr =
         (kprobe_opcode_t *)READ_ONCE(ksu_syscall_table[__NR_faccessat2]);
 
     ksu_sucompat_init();
 
+    /*
+     * Stat-family probes (newfstatat/statx) are intentionally NOT registered:
+     * they only spoof /system/bin/su existence for apps that stat() it, and
+     * their global kprobes add per-call BRK-trap latency on the hottest syscall
+     * path, which timing side-channel detectors fingerprint. Terminal `su`
+     * resolves via the shell's access() PATH lookup (faccessat) + execve, so it
+     * keeps working without the stat probes.
+     */
     ret = register_kprobe(&samsung_sucompat_execve_kprobe);
     if (ret)
         goto exit_sucompat;
@@ -566,32 +520,20 @@ static int samsung_sucompat_hook_init(void)
     if (ret)
         goto unregister_execve;
 
-    ret = register_kprobe(&samsung_sucompat_newfstatat_kprobe);
+    ret = register_kprobe(&samsung_sucompat_faccessat_kprobe);
     if (ret)
         goto unregister_execveat;
 
-    ret = register_kprobe(&samsung_sucompat_faccessat_kprobe);
-    if (ret)
-        goto unregister_newfstatat;
-
-    ret = register_kprobe(&samsung_sucompat_statx_kprobe);
+    ret = register_kprobe(&samsung_sucompat_faccessat2_kprobe);
     if (ret)
         goto unregister_faccessat;
 
-    ret = register_kprobe(&samsung_sucompat_faccessat2_kprobe);
-    if (ret)
-        goto unregister_statx;
-
     samsung_sucompat_kprobes_registered = true;
-    pr_info("hook_manager: Samsung sucompat kprobes registered\n");
+    pr_info("hook_manager: Samsung sucompat kprobes registered (stat probes omitted)\n");
     return 0;
 
-unregister_statx:
-    unregister_kprobe(&samsung_sucompat_statx_kprobe);
 unregister_faccessat:
     unregister_kprobe(&samsung_sucompat_faccessat_kprobe);
-unregister_newfstatat:
-    unregister_kprobe(&samsung_sucompat_newfstatat_kprobe);
 unregister_execveat:
     unregister_kprobe(&samsung_sucompat_execveat_kprobe);
 unregister_execve:
@@ -607,9 +549,7 @@ static void samsung_sucompat_hook_exit(void)
         return;
 
     unregister_kprobe(&samsung_sucompat_faccessat2_kprobe);
-    unregister_kprobe(&samsung_sucompat_statx_kprobe);
     unregister_kprobe(&samsung_sucompat_faccessat_kprobe);
-    unregister_kprobe(&samsung_sucompat_newfstatat_kprobe);
     unregister_kprobe(&samsung_sucompat_execveat_kprobe);
     unregister_kprobe(&samsung_sucompat_execve_kprobe);
     samsung_sucompat_kprobes_registered = false;
