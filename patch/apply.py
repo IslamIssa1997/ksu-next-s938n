@@ -153,6 +153,64 @@ def patch_init_c(ksu_dir):
     print("  patched: kernel/core/init.c")
 
 
+_SAMSUNG_NI_DISPATCHER_BLOCK = r"""#ifdef CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT
+/*
+ * Samsung RKP write-protects sys_call_table at EL2, so the dispatcher function
+ * pointer cannot be patched into an ni_syscall slot. Instead place a kprobe on
+ * __arm64_sys_ni_syscall (the function every unused slot points to); for calls
+ * whose user syscall number equals our reserved dispatcher slot, redirect
+ * execution into ksu_syscall_dispatcher. Any other ni_syscall call (a genuine
+ * invalid syscall) falls through to the real handler. This reaches the
+ * dispatcher with no syscall-table write, keeping ksu_dispatcher_nr >= 0 so the
+ * per-task sys_enter tracepoint path is used: only marked tasks (allowlisted
+ * app / root-ksu / shell / zygote / init) are redirected, unmarked tasks run
+ * syscalls natively, so a timing side-channel sees no per-syscall overhead on
+ * the hot stat/access path.
+ */
+static bool samsung_dispatcher_ni_registered;
+
+static int samsung_dispatcher_ni_pre_handler(struct kprobe *probe, struct pt_regs *regs)
+{
+    struct pt_regs *syscall_regs = task_pt_regs(current);
+
+    (void)probe;
+    if (syscall_regs->syscallno == ksu_dispatcher_nr) {
+        instruction_pointer_set(regs, (unsigned long)ksu_syscall_dispatcher);
+        return 1;
+    }
+    return 0;
+}
+
+static struct kprobe samsung_dispatcher_ni_kprobe = {
+    .symbol_name = "__arm64_sys_ni_syscall",
+    .pre_handler = samsung_dispatcher_ni_pre_handler,
+};
+
+static int samsung_dispatcher_kprobe_init(void)
+{
+    int ret = register_kprobe(&samsung_dispatcher_ni_kprobe);
+
+    if (ret) {
+        pr_err("samsung ni_syscall dispatcher kprobe failed: %d\n", ret);
+        return ret;
+    }
+    samsung_dispatcher_ni_registered = true;
+    pr_info("samsung ni_syscall dispatcher kprobe registered\n");
+    return 0;
+}
+
+static void samsung_dispatcher_kprobe_exit(void)
+{
+    if (samsung_dispatcher_ni_registered) {
+        unregister_kprobe(&samsung_dispatcher_ni_kprobe);
+        samsung_dispatcher_ni_registered = false;
+    }
+}
+#endif
+
+"""
+
+
 def patch_syscall_hook_c(ksu_dir):
     path = os.path.join(ksu_dir, 'kernel', 'hook', 'arm64', 'syscall_hook.c')
     c = read_file(path)
@@ -271,20 +329,69 @@ def patch_syscall_hook_c(ksu_dir):
     check('syscall_hook.c-hook-fn', old, c)
     c = c.replace(old, new, 1)
 
-    # 2. Make dispatcher install check the return value
+    # 1b. Add kprobe/ptrace includes for the Samsung ni_syscall dispatcher.
+    old = ('#include <linux/mutex.h>\n'
+           '#include <asm/cacheflush.h>\n')
+    new = ('#include <linux/mutex.h>\n'
+           '#include <linux/kprobes.h>\n'
+           '#include <linux/ptrace.h>\n'
+           '#include <linux/sched/task_stack.h>\n'
+           '#include <asm/cacheflush.h>\n')
+    check('syscall_hook.c-kprobes-include', old, c)
+    c = c.replace(old, new, 1)
+
+    # 1c. Insert the Samsung ni_syscall dispatcher kprobe before hook_init
+    #     (ksu_syscall_dispatcher is defined above it).
+    old = 'void __init ksu_syscall_hook_init(void)\n{\n    int ni_slot;'
+    new = (_SAMSUNG_NI_DISPATCHER_BLOCK +
+           'void __init ksu_syscall_hook_init(void)\n{\n    int ni_slot;')
+    check('syscall_hook.c-ni-dispatcher-block', old, c)
+    c = c.replace(old, new, 1)
+
+    # 2. Dispatcher install: on Samsung RKP the table write is blocked, so reach
+    #    the dispatcher via the ni_syscall kprobe instead. Keep dispatcher_nr
+    #    >= 0 so the per-task tracepoint path is used (no hot-syscall kprobes).
     old = ('    ksu_dispatcher_nr = ni_slot;\n'
            '    ksu_syscall_table_hook(ksu_dispatcher_nr,\n'
            '                           (syscall_fn_t)ksu_syscall_dispatcher, NULL);\n'
            '    pr_info("dispatcher installed at slot %d\\n", ksu_dispatcher_nr);')
     new = ('    ksu_dispatcher_nr = ni_slot;\n'
+           '#ifdef CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT\n'
+           '    if (samsung_dispatcher_kprobe_init()) {\n'
+           '        pr_warn("dispatcher kprobe unavailable; syscall event hooks disabled\\n");\n'
+           '        ksu_dispatcher_nr = -1;\n'
+           '        return;\n'
+           '    }\n'
+           '#else\n'
            '    if (ksu_syscall_table_hook(ksu_dispatcher_nr,\n'
            '                               (syscall_fn_t)ksu_syscall_dispatcher, NULL)) {\n'
            '        pr_warn("dispatcher unavailable at slot %d; syscall event hooks disabled\\n", ni_slot);\n'
            '        ksu_dispatcher_nr = -1;\n'
            '        return;\n'
            '    }\n'
+           '#endif\n'
            '    pr_info("dispatcher installed at slot %d\\n", ksu_dispatcher_nr);')
     check('syscall_hook.c-dispatcher', old, c)
+    c = c.replace(old, new, 1)
+
+    # 3. Unregister the ni_syscall dispatcher kprobe on module exit.
+    old = ('void __exit ksu_syscall_hook_exit(void)\n'
+           '{\n'
+           '    int i;\n'
+           '\n'
+           '    if (!ksu_syscall_table)\n'
+           '        goto clear_state;')
+    new = ('void __exit ksu_syscall_hook_exit(void)\n'
+           '{\n'
+           '    int i;\n'
+           '\n'
+           '#ifdef CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT\n'
+           '    samsung_dispatcher_kprobe_exit();\n'
+           '#endif\n'
+           '\n'
+           '    if (!ksu_syscall_table)\n'
+           '        goto clear_state;')
+    check('syscall_hook.c-exit-kprobe-cleanup', old, c)
     c = c.replace(old, new, 1)
 
     write_file(path, c)
