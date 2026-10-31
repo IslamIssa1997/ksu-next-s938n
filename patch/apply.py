@@ -1007,9 +1007,208 @@ def patch_dispatch_c(ksu_dir):
     print("  patched: kernel/supercall/dispatch.c")
 
 
+_SELINUX_STCS_OLD = r'''    scontextp = scontext;
+
+    /* Extract the user. */
+    p = scontextp;
+    while (*p && *p != ':')
+        p++;
+
+    if (*p == 0)
+        goto out;
+
+    *p++ = 0;
+
+    usrdatum = symtab_search(&pol->p_users, scontextp);
+    orig_usrdatum = symtab_search(&orig_pol->p_users, scontextp);
+    if (!usrdatum)
+        goto out;
+
+    ctx->user = usrdatum->value;
+    if (orig_usrdatum)
+        orig_ctx->user = orig_usrdatum->value;
+    else
+        orig_valid = false;
+
+    /* Extract role. */
+    scontextp = p;
+    while (*p && *p != ':')
+        p++;
+
+    if (*p == 0)
+        goto out;
+
+    *p++ = 0;
+
+    role = symtab_search(&pol->p_roles, scontextp);
+    orig_role = symtab_search(&orig_pol->p_roles, scontextp);
+    if (!role)
+        goto out;
+    ctx->role = role->value;
+    if (orig_role)
+        orig_ctx->role = orig_role->value;
+    else
+        orig_valid = false;
+
+    /* Extract type. */
+    scontextp = p;
+    while (*p && *p != ':')
+        p++;
+    oldc = *p;
+    *p++ = 0;
+
+    typdatum = symtab_search(&pol->p_types, scontextp);
+    orig_typdatum = symtab_search(&orig_pol->p_types, scontextp);
+    if (!typdatum || typdatum->attribute)
+        goto out;
+
+    ctx->type = typdatum->value;
+    if (orig_typdatum && !orig_typdatum->attribute)
+        orig_ctx->type = orig_typdatum->value;
+    else
+        orig_valid = false;
+
+    rc = mls_context_to_sid(pol, oldc, p, ctx, sidtabp, def_sid);
+    if (orig_valid) {
+        if (oldc) {
+            size_t offset = p - scontext;
+
+            // restore MLS suffix for live policy
+            memcpy(p, source + offset, source_len - offset);
+            p[source_len - offset] = '\0';
+        }
+        // validate live context with live policy
+        orig_rc = mls_context_to_sid(orig_pol, oldc, p, orig_ctx, orig_sidtabp, def_sid);
+        if (!orig_rc && !policydb_context_isvalid(orig_pol, orig_ctx))
+            orig_rc = -EINVAL;
+    }
+
+    if (!rc && !policydb_context_isvalid(pol, ctx))
+        rc = -EINVAL;
+out:'''
+
+_SELINUX_STCS_NEW = r'''    scontextp = scontext;
+
+    /* Extract the user. */
+    user_str = scontextp;
+    p = scontextp;
+    while (*p && *p != ':')
+        p++;
+
+    if (*p == 0)
+        goto out;
+
+    *p++ = 0;
+
+    usrdatum = symtab_search(&pol->p_users, user_str);
+    if (!usrdatum)
+        goto out;
+    ctx->user = usrdatum->value;
+
+    /* Extract role. */
+    scontextp = p;
+    role_str = scontextp;
+    while (*p && *p != ':')
+        p++;
+
+    if (*p == 0)
+        goto out;
+
+    *p++ = 0;
+
+    role = symtab_search(&pol->p_roles, role_str);
+    if (!role)
+        goto out;
+    ctx->role = role->value;
+
+    /* Extract type. */
+    scontextp = p;
+    type_str = scontextp;
+    while (*p && *p != ':')
+        p++;
+    oldc = *p;
+    *p++ = 0;
+
+    typdatum = symtab_search(&pol->p_types, type_str);
+    if (!typdatum || typdatum->attribute)
+        goto out;
+    ctx->type = typdatum->value;
+
+    rc = mls_context_to_sid(pol, oldc, p, ctx, sidtabp, def_sid);
+    if (rc)
+        goto out;
+    if (!policydb_context_isvalid(pol, ctx)) {
+        rc = -EINVAL;
+        goto out;
+    }
+    rc = 0;
+
+    /*
+     * The backup policy accepted the context. Only now consult the live
+     * policy, so a context the backup rejects never performs any live-policy
+     * lookup and every rejection follows the same single-policy path -- this
+     * removes the KSU-specific extra work an attr/current timing probe looks
+     * for, without a stack/heap length branch.
+     */
+    orig_usrdatum = symtab_search(&orig_pol->p_users, user_str);
+    if (orig_usrdatum)
+        orig_ctx->user = orig_usrdatum->value;
+    else
+        orig_valid = false;
+
+    orig_role = symtab_search(&orig_pol->p_roles, role_str);
+    if (orig_role)
+        orig_ctx->role = orig_role->value;
+    else
+        orig_valid = false;
+
+    orig_typdatum = symtab_search(&orig_pol->p_types, type_str);
+    if (orig_typdatum && !orig_typdatum->attribute)
+        orig_ctx->type = orig_typdatum->value;
+    else
+        orig_valid = false;
+
+    if (orig_valid) {
+        if (oldc) {
+            size_t offset = p - scontext;
+
+            // restore MLS suffix for live policy
+            memcpy(p, source + offset, source_len - offset);
+            p[source_len - offset] = '\0';
+        }
+        // validate live context with live policy
+        orig_rc = mls_context_to_sid(orig_pol, oldc, p, orig_ctx, orig_sidtabp, def_sid);
+        if (!orig_rc && !policydb_context_isvalid(orig_pol, orig_ctx))
+            orig_rc = -EINVAL;
+    }
+
+    if (!rc && !policydb_context_isvalid(pol, ctx))
+        rc = -EINVAL;
+out:'''
+
+
 def patch_selinux_hide_c(ksu_dir):
     path = os.path.join(ksu_dir, 'kernel', 'feature', 'selinux_hide.c')
     c = read_file(path)
+
+    # Reduce the selinux_hide attr/current timing side-channel (ref KernelSU
+    # PR #3938): defer every live-policy (orig_pol) lookup in
+    # string_to_context_struct until the backup policy has fully accepted the
+    # context. A rejected context then performs only backup-policy lookups --
+    # the same shape as stock SELinux -- so an invalid-context timing probe
+    # cannot measure the extra dual-policy work. The function signature is
+    # unchanged (only local field-start pointers are added), so the caller and
+    # the live-sync/-ESTALE retry path are untouched.
+    old = ('    char *scontextp, *p, oldc;\n'
+           '    bool orig_valid = true;\n')
+    new = ('    char *scontextp, *p, oldc;\n'
+           '    char *user_str, *role_str, *type_str;\n'
+           '    bool orig_valid = true;\n')
+    check('selinux_hide-timing-decl', old, c)
+    c = c.replace(old, new, 1)
+
+    check('selinux_hide-timing-defer-live', _SELINUX_STCS_OLD, c)
+    c = c.replace(_SELINUX_STCS_OLD, _SELINUX_STCS_NEW, 1)
 
     # Add ksu_samsung_kdp.h include
     old = '#include "selinux_hide.h"\n'
