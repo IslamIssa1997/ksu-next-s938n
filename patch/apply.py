@@ -881,8 +881,9 @@ def patch_tp_marker(ksu_dir):
     c = read_file(path)
 
     # Add samsung kdp header after allowlist include
-    old = '#include "policy/allowlist.h"\n#include "klog.h"'
-    new = '#include "policy/allowlist.h"\n#include "ksu_samsung_kdp.h"\n#include "klog.h"'
+    # (upstream replaced klog.h with selinux/selinux.h in the rewrite)
+    old = '#include "policy/allowlist.h"\n#include "selinux/selinux.h"'
+    new = '#include "policy/allowlist.h"\n#include "ksu_samsung_kdp.h"\n#include "selinux/selinux.h"'
     check('tp_marker-include', old, c)
     c = c.replace(old, new, 1)
 
