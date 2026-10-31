@@ -1856,6 +1856,38 @@ def patch_late_load_rs(ksu_dir):
     check('late_load-susfs-guard', old, c)
     c = c.replace(old, new, 1)
 
+    # Kill flasher residual processes 20 s after late-load.
+    # libcve43499root.so is spawned via the kernel UMH mechanism and survives
+    # the flasher app (PPID=2 kthreadd). ksu-helper / ksu-payload / ksud-s25u-kdp
+    # are staged in /data/local/tmp and may still be alive. SIGKILL all of them
+    # after a 20 s grace period so the kernel module is fully settled first.
+    old = ('    // 7b. Load susfs guard LKM now so the Manager cannot race us with a stock binary\n'
+           '    if let Err(e) = crate::susfsd::load(None) {\n'
+           '        warn!("susfs guard load during late-load: {e}");\n'
+           '    }\n'
+           '\n'
+           '    // 8. Execute late-load stage scripts')
+    new = ('    // 7b. Load susfs guard LKM now so the Manager cannot race us with a stock binary\n'
+           '    if let Err(e) = crate::susfsd::load(None) {\n'
+           '        warn!("susfs guard load during late-load: {e}");\n'
+           '    }\n'
+           '\n'
+           '    // 7c. Kill flasher residual processes after a 20 s grace period.\n'
+           '    //     libcve43499root.so is the kernel UMH process (PPID=2) that\n'
+           '    //     survives the flasher app; the others are staged in /data/local/tmp.\n'
+           '    info!("Waiting 20 s before killing flasher residual processes...");\n'
+           '    std::thread::sleep(std::time::Duration::from_secs(20));\n'
+           '    for name in ["libcve43499root.so", "ksu-helper", "ksu-payload", "ksud-s25u-kdp"] {\n'
+           '        match Command::new("pkill").args(["-9", "-f", name]).status() {\n'
+           '            Ok(s) => info!("pkill -9 -f {name}: {s}"),\n'
+           '            Err(e) => warn!("pkill -9 -f {name} failed: {e}"),\n'
+           '        }\n'
+           '    }\n'
+           '\n'
+           '    // 8. Execute late-load stage scripts')
+    check('late_load-kill-flasher', old, c)
+    c = c.replace(old, new, 1)
+
     # Replace manager restart with adbd restart for adb_root
     old = ('    // 14. Restart Manager so it gets a fresh ksu fd from the newly loaded kernel module\n'
            '    info!("Restarting KernelSU Next Manager {package_name}...");\n'
